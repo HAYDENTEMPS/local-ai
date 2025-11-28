@@ -1,0 +1,895 @@
+import os
+import json
+import requests
+import subprocess
+
+WORKSPACE = r"C:\Apps\local-ai\workspace"
+LLAMA_SERVER = "http://127.0.0.1:8080/v1/chat/completions"
+
+os.makedirs(WORKSPACE, exist_ok=True)
+
+
+def safe_path(path: str):
+    # Make paths relative (fixes leading "/" returned by models)
+    path = path.lstrip("/\\")
+    abs_path = os.path.abspath(os.path.join(WORKSPACE, path))
+
+    if not abs_path.startswith(WORKSPACE):
+        raise Exception("Out-of-bounds file access blocked")
+
+    return abs_path
+
+
+class AgentClient:
+
+    def __init__(self):
+        system_file = os.path.join(WORKSPACE, "system.md")
+        with open(system_file, "r", encoding="utf-8") as f:
+            self.system_prompt = f.read()
+        self.messages = []
+        self.max_turns = 8  # Allow enough for single focused action
+        self.use_subtasks = True  # Enable automatic task decomposition
+
+    def ask(self, prompt: str):
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt}
+        ]
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file inside the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file inside the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_dir",
+                    "description": "List files in the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_directory",
+                    "description": "Create a new directory in the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_command",
+                    "description": "Execute a shell command in the workspace directory",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    }
+                }
+            }
+        ]
+
+        payload = {
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0
+        }
+
+        r = requests.post(LLAMA_SERVER, json=payload)
+        response = r.json()
+
+        if "error" in response:
+            return json.dumps({"error": response["error"]["message"]})
+
+        msg = response["choices"][0]["message"]
+
+        # Tool call?
+        if "tool_calls" in msg:
+            call = msg["tool_calls"][0]["function"]
+            args = json.loads(call["arguments"])
+
+            return json.dumps({
+                "tool": call["name"],
+                **args
+            })
+
+        # Normal text
+        return json.dumps({"response": msg.get("content", "")})
+
+    def handle(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except:
+            return ("MODEL_OUTPUT", raw)
+
+        if "tool" not in data:
+            return ("MODEL_OUTPUT", data.get("response", raw))
+
+        tool = data["tool"]
+
+        if tool == "read_file":
+            abs_path = safe_path(data["path"])
+            with open(abs_path, "r", encoding="utf-8") as f:
+                return ("READ_FILE", f.read())
+
+        if tool == "write_file":
+            abs_path = safe_path(data["path"])
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(data["content"])
+            return ("WRITE_FILE", data["path"])
+
+        if tool == "list_dir":
+            abs_path = safe_path(data["path"])
+            return ("LIST_DIR", os.listdir(abs_path))
+
+        if tool == "create_directory":
+            abs_path = safe_path(data["path"])
+            os.makedirs(abs_path, exist_ok=True)
+            return ("CREATE_DIR", data["path"])
+
+        if tool == "execute_command":
+            try:
+                result = subprocess.run(
+                    data["command"],
+                    shell=True,
+                    cwd=WORKSPACE,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                output = result.stdout + result.stderr
+                return ("EXECUTE", output if output else "[Command completed]")
+            except subprocess.TimeoutExpired:
+                return ("EXECUTE", "[Error: Command timed out]")
+            except Exception as e:
+                return ("EXECUTE", f"[Error: {str(e)}]")
+
+        return ("UNKNOWN", data)
+
+    def run_conversation(self, user_prompt: str, progress_callback=None):
+        """
+        Run a multi-turn conversation that allows the agent to execute
+        multiple steps until it provides a final text response.
+        Returns a list of (event_type, data) tuples for each step.
+
+        progress_callback: Optional function(event_type, data) called after each step
+        """
+        # Initialize conversation with system prompt and user message
+        self.messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file inside the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file inside the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_dir",
+                    "description": "List files in the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_directory",
+                    "description": "Create a new directory in the workspace",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_command",
+                    "description": "Execute a shell command in the workspace directory",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    }
+                }
+            }
+        ]
+
+        steps = []  # Track all steps taken
+        turn_count = 0
+        error_history = []  # Track recent errors to detect loops
+        successful_actions = 0  # Track completed actions to prevent over-doing
+
+        while turn_count < self.max_turns:
+            turn_count += 1
+
+            # Get model response
+            payload = {
+                "messages": self.messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "temperature": 0
+            }
+
+            try:
+                # Shorter timeout since subtasks are focused and fast
+                r = requests.post(LLAMA_SERVER, json=payload, timeout=180)
+                response = r.json()
+            except requests.exceptions.Timeout:
+                steps.append(("ERROR", "Request to llama-server timed out after 3 minutes"))
+                if progress_callback:
+                    progress_callback("ERROR", "Request timed out - subtask may be too complex")
+                break
+            except requests.exceptions.RequestException as e:
+                steps.append(("ERROR", f"Network error: {str(e)}"))
+                if progress_callback:
+                    progress_callback("ERROR", f"Network error: {str(e)}")
+                break
+            except json.JSONDecodeError as e:
+                steps.append(("ERROR", f"Invalid JSON response from server: {str(e)}"))
+                if progress_callback:
+                    progress_callback("ERROR", "Invalid server response")
+                break
+
+            if "error" in response:
+                error_msg = response.get("error", {}).get("message", "Unknown error")
+                steps.append(("ERROR", error_msg))
+                if progress_callback:
+                    progress_callback("ERROR", error_msg)
+                break
+
+            if "choices" not in response or len(response["choices"]) == 0:
+                steps.append(("ERROR", "No response from model"))
+                if progress_callback:
+                    progress_callback("ERROR", "No response from model")
+                break
+
+            msg = response["choices"][0]["message"]
+            self.messages.append(msg)  # Add assistant's response to history
+
+            # Check if it's a tool call
+            if "tool_calls" in msg and len(msg["tool_calls"]) > 0:
+                tool_call = msg["tool_calls"][0]
+                function_name = tool_call["function"]["name"]
+                args = json.loads(tool_call["function"]["arguments"])
+
+                # Execute the tool
+                event_type, result = self._execute_tool(function_name, args)
+                steps.append((event_type, result))
+
+                # Count successful actions
+                if event_type in ["WRITE_FILE", "CREATE_DIR", "EXECUTE"]:
+                    successful_actions += 1
+
+                # Send progress update immediately
+                if progress_callback:
+                    progress_callback(event_type, result)
+
+                # Detect error loops - if same error 3 times in a row, stop
+                if event_type == "EXECUTE" and "syntax" in str(result).lower():
+                    error_history.append(str(result))
+                    if len(error_history) >= 3:
+                        # Check if last 3 errors are similar
+                        if all("syntax" in e.lower() for e in error_history[-3:]):
+                            steps.append(("ERROR", "Detected repeated command errors. Stopping to prevent infinite loop."))
+                            if progress_callback:
+                                progress_callback("ERROR", "Detected repeated command errors. Stopping.")
+                            break
+                else:
+                    error_history.clear()  # Reset on success
+
+                # Add tool result to conversation history
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": str(result)
+                })
+
+                # Stop after 1 successful action - strict single-action per subtask
+                if successful_actions >= 1:
+                    steps.append(("MODEL_OUTPUT", f"Action complete."))
+                    if progress_callback:
+                        progress_callback("MODEL_OUTPUT", f"Step complete.")
+                    break
+
+                # Continue loop to get next action from model
+
+            else:
+                # No tool call - model provided final text response
+                final_text = msg.get("content", "")
+                if final_text:
+                    steps.append(("MODEL_OUTPUT", final_text))
+                    if progress_callback:
+                        progress_callback("MODEL_OUTPUT", final_text)
+                break
+
+        if turn_count >= self.max_turns:
+            warning = "Maximum turns reached. Task may be incomplete."
+            steps.append(("WARNING", warning))
+            if progress_callback:
+                progress_callback("WARNING", warning)
+
+        return steps
+
+    def _execute_tool(self, tool_name: str, args: dict):
+        """Execute a tool and return (event_type, result) tuple"""
+        try:
+            if tool_name == "read_file":
+                abs_path = safe_path(args["path"])
+                with open(abs_path, "r", encoding="utf-8") as f:
+                    return ("READ_FILE", f.read())
+
+            elif tool_name == "write_file":
+                abs_path = safe_path(args["path"])
+                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(args["content"])
+                return ("WRITE_FILE", args["path"])
+
+            elif tool_name == "list_dir":
+                abs_path = safe_path(args["path"])
+                return ("LIST_DIR", os.listdir(abs_path))
+
+            elif tool_name == "create_directory":
+                abs_path = safe_path(args["path"])
+                os.makedirs(abs_path, exist_ok=True)
+                return ("CREATE_DIR", args["path"])
+
+            elif tool_name == "execute_command":
+                result = subprocess.run(
+                    args["command"],
+                    shell=True,
+                    cwd=WORKSPACE,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                output = result.stdout + result.stderr
+                return ("EXECUTE", output if output else "[Command completed]")
+
+            else:
+                return ("UNKNOWN", f"Unknown tool: {tool_name}")
+
+        except subprocess.TimeoutExpired:
+            return ("ERROR", "Command timed out")
+        except Exception as e:
+            return ("ERROR", str(e))
+
+    def run_with_subtasks(self, user_prompt: str, progress_callback=None):
+        """
+        Intelligently breaks down complex requests into subtasks and executes them
+        one by one. Each subtask gets its own fast LLM call.
+        """
+        # Check if task is simple enough to run directly
+        simple_keywords = ['create a file', 'create a folder', 'read', 'list', 'write a file']
+        is_simple = any(keyword in user_prompt.lower() for keyword in simple_keywords)
+        is_short = len(user_prompt.split()) < 15
+
+        if is_simple or is_short:
+            # Run directly without decomposition
+            return self.run_conversation(user_prompt, progress_callback)
+
+        # Step 0: Architecture Planning - Think about component relationships
+        if progress_callback:
+            progress_callback("PLANNING", "Analyzing architecture and component relationships...")
+
+        architecture = self._plan_architecture(user_prompt, progress_callback)
+
+        # Step 1: Ask the model to create a task breakdown
+        if progress_callback:
+            progress_callback("PLANNING", "Breaking down task into steps...")
+
+        planning_prompt = f"""Task: {user_prompt}
+
+Break this down into 5-10 focused subtasks. Each step is ONE complete action.
+
+IMPORTANT RULES:
+- DO NOT create micro-steps like "add one import" - imports go in the file when it's created
+- Each step should create ONE complete, working file or folder
+- ALL paths must include the project folder name (e.g., MyApp/pages/index.js, not pages/index.js)
+- ALWAYS include install and testing steps at the end
+- Use correct relative import paths (pages/ imports from ../components/, not ./components/)
+
+GOOD examples:
+1. Create project folder called MyApp
+2. Create MyApp/package.json with all dependencies and scripts
+3. Create MyApp/pages directory
+4. Create MyApp/pages/index.js with CORRECT imports (../components/Header)
+5. Create MyApp/components/Header.js with complete component code
+6. Run npm install in MyApp directory
+7. Run npm run dev and check for errors
+8. Fix any import or syntax errors found
+
+BAD examples:
+❌ Create package.json (missing project folder!)
+❌ Add "next" dependency to package.json (too granular - do all deps at once)
+❌ Add import React to index.js (too granular - imports go with file creation)
+❌ Create pages/index.js (missing project folder prefix!)
+❌ Import from './Header' in pages/index.js (wrong path - should be '../components/Header')
+
+Respond ONLY with a numbered list of 5-10 steps.
+
+Your subtasks:"""
+
+        try:
+            import random
+            # Add random value to prevent cache reuse
+            cache_buster = f"\n\n[Request ID: {random.randint(10000, 99999)}]"
+
+            payload = {
+                "messages": [
+                    {"role": "system", "content": "You are a task planning assistant. Break down coding tasks into small steps."},
+                    {"role": "user", "content": planning_prompt + cache_buster}
+                ],
+                "temperature": 0,
+                "max_tokens": 400
+            }
+
+            r = requests.post(LLAMA_SERVER, json=payload, timeout=60)
+            response = r.json()
+
+            if "choices" not in response or len(response["choices"]) == 0:
+                # Fall back to single conversation if planning fails
+                return self.run_conversation(user_prompt, progress_callback)
+
+            plan_text = response["choices"][0]["message"]["content"]
+
+            # Parse the numbered list
+            subtasks = []
+            for line in plan_text.strip().split('\n'):
+                line = line.strip()
+                # Match "1. Task" or "1) Task" or "- Task"
+                if line and (line[0].isdigit() or line.startswith('-')):
+                    # Remove numbering
+                    task = line.split('.', 1)[-1].split(')', 1)[-1].strip('- ').strip()
+                    if task:
+                        subtasks.append(task)
+
+            if not subtasks:
+                # Couldn't parse plan, fall back
+                return self.run_conversation(user_prompt, progress_callback)
+
+            if progress_callback:
+                progress_callback("PLAN", f"Plan created: {len(subtasks)} steps")
+                for i, task in enumerate(subtasks, 1):
+                    progress_callback("PLAN", f"  {i}. {task}")
+
+        except Exception as e:
+            # Planning failed, fall back to regular conversation
+            if progress_callback:
+                progress_callback("WARNING", f"Planning failed: {e}. Running as single task.")
+            return self.run_conversation(user_prompt, progress_callback)
+
+        # Extract project context from original request
+        project_context = self._extract_project_context(user_prompt)
+
+        # Get recommended folder structure for this framework
+        folder_structure = self._get_folder_structure(project_context)
+
+        # Step 2: Execute each subtask one by one with full context
+        all_steps = []
+        completed_steps = []
+        created_files = []  # Track all files created during execution
+
+        for i, subtask in enumerate(subtasks, 1):
+            if progress_callback:
+                progress_callback("SUBTASK_START", f"Step {i}/{len(subtasks)}: {subtask}")
+
+            # Build context-aware subtask prompt
+            context_prompt = self._build_contextual_prompt(
+                original_request=user_prompt,
+                project_context=project_context,
+                current_subtask=subtask,
+                completed_steps=completed_steps,
+                created_files=created_files,
+                folder_structure=folder_structure,
+                architecture=architecture,
+                step_number=i,
+                total_steps=len(subtasks)
+            )
+
+            # Execute this subtask with full project context
+            subtask_steps = self.run_conversation(context_prompt, progress_callback)
+            all_steps.extend(subtask_steps)
+
+            # Extract and track any files created in this subtask
+            for event_type, data in subtask_steps:
+                if event_type == "WRITE_FILE":
+                    created_files.append(data)
+                elif event_type == "CREATE_DIR":
+                    created_files.append(f"{data}/ (folder)")
+
+            # Track what we've completed
+            completed_steps.append(f"Step {i}: {subtask}")
+
+            if progress_callback:
+                progress_callback("SUBTASK_DONE", f"✓ Completed step {i}/{len(subtasks)}")
+
+        # Final summary with user instructions
+        if progress_callback:
+            progress_callback("COMPLETE", f"All {len(subtasks)} steps completed!")
+
+            # Check if this is a Node.js project and remind about npm install
+            if project_context.get('framework') in ['Next.js', 'React', 'Vue', 'Express.js']:
+                project_name = project_context.get('project_name', 'the project folder')
+                progress_callback("NEXT_STEPS", f"""
+To finish setup, run:
+  cd {project_name}
+  npm install
+  npm run dev
+""")
+            elif project_context.get('framework') in ['Flask', 'Django']:
+                project_name = project_context.get('project_name', 'the project folder')
+                progress_callback("NEXT_STEPS", f"""
+To finish setup, run:
+  cd {project_name}
+  pip install -r requirements.txt
+  python app.py
+""")
+
+        return all_steps
+
+    def _extract_project_context(self, user_prompt: str):
+        """Extract key project information from the user's request"""
+        prompt_lower = user_prompt.lower()
+
+        # Detect framework/technology
+        framework = None
+        if 'next.js' in prompt_lower or 'nextjs' in prompt_lower:
+            framework = 'Next.js'
+        elif 'react' in prompt_lower:
+            framework = 'React'
+        elif 'vue' in prompt_lower:
+            framework = 'Vue'
+        elif 'flask' in prompt_lower:
+            framework = 'Flask'
+        elif 'express' in prompt_lower:
+            framework = 'Express.js'
+        elif 'django' in prompt_lower:
+            framework = 'Django'
+
+        # Extract project name (look for "called X" or "named X")
+        project_name = None
+        import re
+        name_match = re.search(r'(?:called|named)\s+([A-Za-z0-9_-]+)', user_prompt)
+        if name_match:
+            project_name = name_match.group(1)
+
+        # Detect language
+        language = None
+        if framework in ['Next.js', 'React', 'Vue', 'Express.js']:
+            language = 'JavaScript'
+        elif framework in ['Flask', 'Django']:
+            language = 'Python'
+        elif 'python' in prompt_lower:
+            language = 'Python'
+        elif 'javascript' in prompt_lower or 'node' in prompt_lower:
+            language = 'JavaScript'
+
+        return {
+            'framework': framework,
+            'project_name': project_name,
+            'language': language
+        }
+
+    def _build_contextual_prompt(self, original_request, project_context, current_subtask,
+                                  completed_steps, created_files, folder_structure, architecture,
+                                  step_number, total_steps):
+        """Build a context-rich prompt for a subtask"""
+
+        context_parts = [f"OVERALL GOAL: {original_request}"]
+
+        # Add project metadata
+        if project_context['framework']:
+            context_parts.append(f"FRAMEWORK: {project_context['framework']}")
+        if project_context['language']:
+            context_parts.append(f"LANGUAGE: {project_context['language']}")
+        if project_context['project_name']:
+            context_parts.append(f"PROJECT FOLDER: {project_context['project_name']}")
+            context_parts.append(f"IMPORTANT: All files must go inside the '{project_context['project_name']}' folder!")
+
+        # Add architecture plan
+        if architecture:
+            context_parts.append(f"\nARCHITECTURE PLAN:")
+            context_parts.append(architecture)
+
+        # Add recommended folder structure
+        if folder_structure and project_context['project_name']:
+            context_parts.append(f"\nRECOMMENDED STRUCTURE for {project_context['framework']}:")
+            context_parts.append(folder_structure)
+
+        # Add progress tracking
+        context_parts.append(f"\nPROGRESS: Step {step_number} of {total_steps}")
+
+        # Add completed steps summary
+        if completed_steps:
+            context_parts.append("\nCOMPLETED STEPS:")
+            for step in completed_steps:
+                context_parts.append(f"  ✓ {step}")
+
+        # Add created files registry
+        if created_files:
+            context_parts.append("\nCREATED FILES (available for reference):")
+            for file_path in created_files:
+                context_parts.append(f"  📄 {file_path}")
+
+        # Add current task with strict instructions
+        context_parts.append(f"\n{'='*60}")
+        context_parts.append(f"CURRENT TASK (Do ONLY this, nothing else):")
+        context_parts.append(f"  {current_subtask}")
+        context_parts.append(f"{'='*60}")
+
+        # Add critical reminders with strict constraints
+        if project_context['project_name']:
+            proj_name = project_context['project_name']
+            context_parts.append(f"\nPATH REQUIREMENTS (CRITICAL!):")
+            context_parts.append(f"  ✓ ALL files must start with '{proj_name}/'")
+            context_parts.append(f"  ✓ Example: '{proj_name}/pages/index.js' (CORRECT)")
+            context_parts.append(f"  ✗ Example: 'pages/index.js' (WRONG - missing {proj_name}/)")
+            context_parts.append(f"  ✗ Example: 'components/File.js' (WRONG - missing {proj_name}/)")
+            context_parts.append(f"\nOTHER RULES:")
+            context_parts.append(f"  ✓ Do ONLY the current task above")
+            context_parts.append(f"  ✗ DO NOT do future steps early")
+            context_parts.append(f"  ✗ DO NOT create extra files not mentioned in current task")
+            context_parts.append(f"\nFor reference (DO NOT implement yet):")
+            context_parts.append(f"  - Architecture plan shows the big picture")
+            context_parts.append(f"  - You can read files from CREATED FILES if needed")
+
+        return "\n".join(context_parts)
+
+    def _get_folder_structure(self, project_context):
+        """Get recommended folder structure for the framework"""
+        framework = project_context.get('framework')
+        project_name = project_context.get('project_name', 'project')
+
+        structures = {
+            'Next.js': f"""{project_name}/
+├── pages/
+│   ├── index.js          (homepage)
+│   ├── _app.js           (app wrapper)
+│   └── api/              (API routes)
+│       └── *.js
+├── components/           (React components)
+│   └── *.js
+├── public/               (static files)
+│   └── images/
+├── styles/               (CSS files)
+│   └── globals.css
+├── package.json
+└── next.config.js""",
+
+            'React': f"""{project_name}/
+├── public/
+│   └── index.html
+├── src/
+│   ├── index.js          (entry point)
+│   ├── App.js            (main component)
+│   ├── components/       (React components)
+│   │   └── *.js
+│   ├── pages/            (page components)
+│   │   └── *.js
+│   ├── styles/           (CSS files)
+│   │   └── *.css
+│   └── utils/            (utilities)
+├── package.json
+└── README.md""",
+
+            'Flask': f"""{project_name}/
+├── app.py                (main application)
+├── routes/               (route handlers)
+│   └── *.py
+├── models/               (database models)
+│   └── *.py
+├── templates/            (HTML templates)
+│   └── *.html
+├── static/               (CSS, JS, images)
+│   ├── css/
+│   ├── js/
+│   └── images/
+├── requirements.txt
+└── venv/                 (virtual environment)""",
+
+            'Express.js': f"""{project_name}/
+├── server.js             (entry point)
+├── routes/               (route handlers)
+│   └── *.js
+├── controllers/          (business logic)
+│   └── *.js
+├── models/               (data models)
+│   └── *.js
+├── middleware/           (custom middleware)
+│   └── *.js
+├── public/               (static files)
+│   ├── css/
+│   └── js/
+├── views/                (templates if using)
+├── package.json
+└── .env                  (environment vars)""",
+
+            'Django': f"""{project_name}/
+├── manage.py
+├── {project_name}/
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── urls.py
+│   └── wsgi.py
+├── apps/                 (Django apps)
+│   └── app_name/
+│       ├── models.py
+│       ├── views.py
+│       ├── urls.py
+│       └── templates/
+├── static/
+├── media/
+└── requirements.txt""",
+
+            'Vue': f"""{project_name}/
+├── public/
+│   └── index.html
+├── src/
+│   ├── main.js           (entry point)
+│   ├── App.vue           (root component)
+│   ├── components/       (Vue components)
+│   │   └── *.vue
+│   ├── views/            (page components)
+│   │   └── *.vue
+│   ├── router/           (Vue Router)
+│   │   └── index.js
+│   ├── store/            (Vuex store)
+│   │   └── index.js
+│   └── assets/           (images, styles)
+├── package.json
+└── vue.config.js"""
+        }
+
+        return structures.get(framework, None)
+
+    def _plan_architecture(self, user_prompt: str, progress_callback=None):
+        """
+        Create an architecture plan that describes how components connect,
+        what data flows between them, and their dependencies.
+        """
+        import random
+
+        architecture_prompt = f"""Task: {user_prompt}
+
+Before implementing, design the overall architecture. Describe:
+
+1. COMPONENTS: What are the main components/files needed?
+2. RELATIONSHIPS: How do components connect? What imports what?
+3. DATA FLOW: What data is passed between components? (props, API calls, etc.)
+4. DEPENDENCIES: What depends on what? What should be created first?
+
+Be specific and concise. Format:
+
+COMPONENTS:
+- ComponentA: Description and purpose
+- ComponentB: Description and purpose
+
+CONNECTIONS:
+- Homepage imports and uses ComponentA
+- ComponentA calls API endpoint X
+- API endpoint returns data to ComponentA
+
+DATA FLOW:
+- User input (city name) → WeatherForm
+- WeatherForm → API call → Weather data
+- Weather data → WeatherDisplay component
+
+Your architecture design:"""
+
+        try:
+            # Add random value to prevent cache reuse
+            cache_buster = f"\n\n[Request ID: {random.randint(10000, 99999)}]"
+
+            payload = {
+                "messages": [
+                    {"role": "system", "content": "You are a software architect. Design clear, well-structured applications."},
+                    {"role": "user", "content": architecture_prompt + cache_buster}
+                ],
+                "temperature": 0.3,  # Slightly higher for creative thinking
+                "max_tokens": 500,
+                "cache_prompt": False  # Try to disable caching if supported
+            }
+
+            r = requests.post(LLAMA_SERVER, json=payload, timeout=90)
+            response = r.json()
+
+            if "choices" not in response or len(response["choices"]) == 0:
+                return None
+
+            architecture_plan = response["choices"][0]["message"]["content"]
+
+            if progress_callback:
+                # Show the architecture plan to the user
+                progress_callback("ARCHITECTURE", f"Architecture designed:\n{architecture_plan}")
+
+            return architecture_plan
+
+        except Exception as e:
+            if progress_callback:
+                progress_callback("WARNING", f"Architecture planning failed: {e}")
+            return None

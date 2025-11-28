@@ -1,0 +1,12 @@
+QWidget {
+    background-color: #0d0d0d;
+    color: #e6e6e6;
+    font-family: Consolas;
+}
+
+QLineEdit {
+    background: #111;
+    border: 1px solid #444;
+    padding: 6px;
+    color: #eee;
+}

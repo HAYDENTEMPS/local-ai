@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir /s /b)",
+      "Bash(curl:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(where:*)",
+      "Bash(./llama-server.exe:*)",
+      "Bash(dir:*)",
+      "Bash(/c/Users/templetonh/local-ai/llama-server.exe:*)",
+      "Bash(cat:*)",
+      "Bash(cmd //c start_local_ai.bat qwen cpu)",
+      "Bash(unix2dos:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
